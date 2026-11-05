@@ -142,7 +142,7 @@ Other entry points:
 | Command | What it does |
 |---|---|
 | `npm run dashboard` | Production build of the UI, served by the API at http://127.0.0.1:8787 |
-| `npm run build:all && npm start` | Exactly what Railway runs (compiled server + built UI) |
+| `npm run build && npm start` | Exactly what Railway runs (compiled server + built UI) |
 | `npm run demo -- --dry` | Policy-violation demo only (spends nothing) |
 | `npm run demo` | Live: one intent on Ethereum Sepolia, one on Base Sepolia, then 3 blocked intents |
 | `npm run demo -- --concurrent` | Also fires two intents at once to show the nonce queue |
@@ -151,7 +151,7 @@ Other entry points:
 
 ### Deploy on Railway (hosted judge demo)
 
-One service serves both the API and the built dashboard. [`railway.json`](railway.json) holds the build, start and health-check config.
+One service serves both the API and the built dashboard. [`railway.json`](railway.json) holds the build, start and health-check config; `npm run build` compiles the server and builds the UI.
 
 1. Railway → **New Project → Deploy from GitHub repo** → select this repository.
 2. **Variables** (encrypted by Railway, never committed):

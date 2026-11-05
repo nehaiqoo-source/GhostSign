@@ -4,7 +4,7 @@
   "description": "Autonomous AI agent execution layer using NEAR Chain Signatures (MPC) to sign foreign-chain transactions",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "npm run build:server && npm run dashboard:build",
     "dev": "tsx src/index.ts",
     "start": "node dist/server/index.js",
     "typecheck": "tsc -p tsconfig.dev.json",
@@ -16,8 +16,9 @@
     "dashboard:typecheck": "tsc -p dashboard/tsconfig.json",
     "dev:all": "concurrently -k -n api,ui -c green,cyan \"npm:api\" \"npm:dashboard:dev\"",
     "dashboard": "npm run dashboard:build && npm run api",
-    "build:all": "npm run build && npm run dashboard:build",
-    "cli": "node dist/index.js"
+    "build:all": "npm run build",
+    "cli": "node dist/index.js",
+    "build:server": "tsc -p tsconfig.json"
   },
   "author": "",
   "license": "MIT",
