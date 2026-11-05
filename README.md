@@ -116,7 +116,7 @@ Funds were sent to the agent's own treasury at path `ethereum-2` ([`0x98f4b114â€
 **Requirements:** Node.js â‰¥ 22.22, and a funded NEAR testnet account (a few NEAR covers hundreds of signatures; each `sign` costs about 0.001 NEAR in gas and the deposit is refunded).
 
 ```bash
-git clone <repo-url> GhostSign && cd GhostSign
+git clone https://github.com/nehaiqoo-source/GhostSign.git && cd GhostSign
 npm install
 cp .env.example .env
 ```
