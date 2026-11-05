@@ -79,6 +79,19 @@ export type GatewayEvent =
   | { type: "intent.signing"; intent: AgentIntent; from: string }
   | { type: "intent.executed"; intent: AgentIntent; result: IntentSuccess };
 
+/** Fine-grained progress of a single intent, for UIs and audit logs. */
+export type IntentStage =
+  | { stage: "validated"; intent: AgentIntent }
+  | { stage: "policy_passed"; from: `0x${string}` }
+  | { stage: "nonce_acquired"; nonce: number }
+  | { stage: "mpc_signing"; digest: string }
+  | { stage: "mpc_signed"; nearTxHash: string }
+  | { stage: "broadcast"; txHash: string; explorerUrl: string };
+
+export interface ExecuteOptions {
+  onStage?: (stage: IntentStage) => void;
+}
+
 export interface IntentGatewayOptions {
   policy: PolicyEngine;
   executors: Partial<Record<ChainKey, EvmExecutorLike>>;
@@ -133,12 +146,24 @@ export class IntentGateway {
     });
   }
 
+  /** The executor for a chain, if configured. */
+  executor(chain: ChainKey): EvmExecutorLike | undefined {
+    return this.executors[chain];
+  }
+
   /** The agent's address for a path. Identical on every EVM chain. */
   addressFor(chain: ChainKey, derivationPath = this.defaultPath): `0x${string}` {
     return this.executorFor(chain).addressFor(derivationPath);
   }
 
-  async execute(rawIntent: unknown): Promise<IntentResult> {
+  async execute(rawIntent: unknown, opts: ExecuteOptions = {}): Promise<IntentResult> {
+    const stage = (s: IntentStage) => {
+      try {
+        opts.onStage?.(s);
+      } catch {
+        // observers must never break execution
+      }
+    };
     const started = performance.now();
     const elapsed = () => Math.round(performance.now() - started);
 
@@ -150,6 +175,7 @@ export class IntentGateway {
     }
     const intent = parsed.data;
     this.emit({ type: "intent.received", intent });
+    stage({ stage: "validated", intent });
     const path = intent.derivationPath ?? this.defaultPath;
     const valueWei = parseEther(intent.amount);
 
@@ -171,10 +197,21 @@ export class IntentGateway {
         );
       }
 
+      stage({ stage: "policy_passed", from });
+
       // 4–6. Nonce queue → MPC signature → broadcast.
       this.emit({ type: "intent.signing", intent, from });
-      const sent = await executor.send(path, { to: intent.to, value: valueWei });
+      const sent = await executor.send(
+        path,
+        { to: intent.to, value: valueWei },
+        {
+          onNonce: (nonce) => stage({ stage: "nonce_acquired", nonce }),
+          onSigning: (digest) => stage({ stage: "mpc_signing", digest }),
+          onSigned: (nearTxHash) => stage({ stage: "mpc_signed", nearTxHash }),
+        },
+      );
       reservation.commit();
+      stage({ stage: "broadcast", txHash: sent.txHash, explorerUrl: sent.explorerUrl });
 
       // 7. Result
       const result: IntentSuccess = {

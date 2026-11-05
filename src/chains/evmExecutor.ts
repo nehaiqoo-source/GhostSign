@@ -39,12 +39,28 @@ export interface EvmSendResult {
   rawTransaction: string;
 }
 
+/** Progress callbacks fired from inside the serialized critical section. */
+export interface SendHooks {
+  /** Lane acquired and nonce allocated. */
+  onNonce?(nonce: number): void;
+  /** Unsigned tx built; NEAR MPC `sign` is being called. */
+  onSigning?(digest: string): void;
+  /** MPC signature received and verified. */
+  onSigned?(nearTxHash: string): void;
+}
+
+export interface Confirmation {
+  status: "success" | "reverted";
+  blockNumber: number;
+}
+
 /** What the intent gateway needs from an executor. */
 export interface EvmExecutorLike {
   readonly chain: EvmChainConfig;
   addressFor(derivationPath: string): `0x${string}`;
   getBalance(address: string): Promise<bigint>;
-  send(derivationPath: string, req: EvmTxRequest): Promise<EvmSendResult>;
+  send(derivationPath: string, req: EvmTxRequest, hooks?: SendHooks): Promise<EvmSendResult>;
+  waitForConfirmation?(txHash: string, timeoutMs?: number): Promise<Confirmation>;
 }
 
 export interface EvmExecutorOptions {
@@ -93,7 +109,7 @@ export class EvmExecutor implements EvmExecutorLike {
   }
 
   /** Serialize via the nonce queue, MPC-sign, broadcast. */
-  async send(derivationPath: string, req: EvmTxRequest): Promise<EvmSendResult> {
+  async send(derivationPath: string, req: EvmTxRequest, hooks: SendHooks = {}): Promise<EvmSendResult> {
     if (!isAddress(req.to)) {
       throw new GhostSignError(ErrorCode.INVALID_INTENT, `Invalid destination address: ${req.to}`);
     }
@@ -101,8 +117,10 @@ export class EvmExecutor implements EvmExecutorLike {
     const from = this.addressFor(derivationPath);
 
     return this.nonces.run(this.chain.chainId, from, this.provider, async ({ nonce }) => {
+      safe(() => hooks.onNonce?.(nonce));
       const tx = await this.buildUnsigned(from, req, nonce);
       const digest = tx.unsignedHash;
+      safe(() => hooks.onSigning?.(digest));
 
       let mpc: MpcSignature;
       try {
@@ -119,6 +137,7 @@ export class EvmExecutor implements EvmExecutorLike {
       if (tx.from !== from) {
         throw new GhostSignError(ErrorCode.SIGNATURE_MISMATCH, `Signed sender ${tx.from} ≠ derived ${from}`);
       }
+      safe(() => hooks.onSigned?.(mpc.nearTxHash));
 
       const rawTransaction = tx.serialized;
       let txHash: string;
@@ -144,6 +163,13 @@ export class EvmExecutor implements EvmExecutorLike {
         rawTransaction,
       };
     });
+  }
+
+  /** Wait for one confirmation. Throws on timeout. */
+  async waitForConfirmation(txHash: string, timeoutMs = 180_000): Promise<Confirmation> {
+    const receipt = await this.provider.waitForTransaction(txHash, 1, timeoutMs);
+    if (!receipt) throw new Error(`No receipt for ${txHash}`);
+    return { status: receipt.status === 1 ? "success" : "reverted", blockNumber: receipt.blockNumber };
   }
 
   private async assertChain(): Promise<void> {
@@ -200,6 +226,14 @@ export class EvmExecutor implements EvmExecutorLike {
       maxFeePerGas,
       maxPriorityFeePerGas,
     });
+  }
+}
+
+function safe(fn: () => void): void {
+  try {
+    fn();
+  } catch {
+    // progress observers must never break signing
   }
 }
 

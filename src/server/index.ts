@@ -1,0 +1,368 @@
+/**
+ * GhostSign local API for the dashboard.
+ *
+ * Binds to 127.0.0.1 only: this process holds the NEAR key that authorises MPC signatures, so it
+ * must never be exposed to a network. Mutating requests from a non-local browser Origin are refused.
+ *
+ *   GET  /api/state            agent identity, chains, policy
+ *   GET  /api/balances         live balances (EVM chains + NEAR)
+ *   GET  /api/feed             audit feed
+ *   GET  /api/events           server-sent events: feed + policy updates
+ *   POST /api/intents          { chain, to, amount, reason } → 202 { id }
+ *   POST /api/policy/freeze    { frozen: boolean, reason?: string }
+ *
+ * In production mode it also serves the built dashboard from dashboard/dist.
+ */
+import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { extname, join, normalize, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { formatEther } from "ethers";
+import { JsonRpcProvider as NearRpcProvider } from "near-api-js";
+import { IntentGateway, type IntentResult, type IntentStage } from "../agent/intentGateway.js";
+import { SUPPORTED_CHAINS, getChainConfig, txExplorerUrl } from "../chains/config.js";
+import { loadEnv, requireEnv } from "../config/env.js";
+import { deriveChildPublicKey } from "../crypto/kdf.js";
+import { PROOF_AGENT_ACCOUNT, PROVEN_TXS } from "./history.js";
+
+const env = loadEnv();
+const PORT = Number(process.env.GHOSTSIGN_API_PORT ?? 8787);
+const HOST = "127.0.0.1";
+const AGENT_PATH = "ethereum-1";
+const TREASURY_PATH = "ethereum-2";
+const MAX_BODY = 16 * 1024;
+const MAX_FEED = 200;
+const DASHBOARD_DIST = resolve(fileURLToPath(new URL("../../dashboard/dist", import.meta.url)));
+
+const nearAccount = requireEnv(env, "NEAR_ACCOUNT_ID");
+const gateway = IntentGateway.fromEnv({ env });
+const agentKey = deriveChildPublicKey(env.MPC_ROOT_PUBLIC_KEY, nearAccount, AGENT_PATH);
+const treasury = deriveChildPublicKey(env.MPC_ROOT_PUBLIC_KEY, nearAccount, TREASURY_PATH).ethereumAddress;
+const nearProvider = new NearRpcProvider({ url: env.NEAR_NODE_URL });
+
+// ───────────────────────────── audit feed ─────────────────────────────
+
+type StageName = IntentStage["stage"] | "confirmed";
+type EntryStatus = "running" | "broadcast" | "confirmed" | "blocked" | "failed";
+
+interface FeedEntry {
+  id: string;
+  source: "dashboard" | "cli-history";
+  createdAt: number;
+  chain: string;
+  to: string;
+  amount: string;
+  reason: string;
+  status: EntryStatus;
+  stages: Array<{ stage: StageName; at: number }>;
+  from?: string;
+  nonce?: number;
+  txHash?: string;
+  explorerUrl?: string;
+  nearTxHash?: string;
+  blockNumber?: number;
+  code?: string;
+  error?: string;
+  rejectedBeforeSigning?: boolean;
+  executionTimeMs?: number;
+}
+
+const feed: FeedEntry[] = [];
+
+if (nearAccount === PROOF_AGENT_ACCOUNT) {
+  // Oldest first so the newest ends up on top after unshift.
+  PROVEN_TXS.forEach((p, i) => {
+    const chain = getChainConfig(p.chain, env);
+    feed.unshift({
+      id: `history-${i}`,
+      source: "cli-history",
+      createdAt: 0,
+      chain: p.chain,
+      to: treasury,
+      amount: p.amount,
+      reason: p.reason,
+      status: "confirmed",
+      stages: [],
+      from: agentKey.ethereumAddress,
+      nonce: p.nonce,
+      txHash: p.txHash,
+      explorerUrl: txExplorerUrl(chain, p.txHash),
+      nearTxHash: p.nearTxHash,
+      blockNumber: p.blockNumber,
+    });
+  });
+}
+
+// ───────────────────────────── SSE ─────────────────────────────
+
+const clients = new Set<ServerResponse>();
+
+function publish(event: string, data: unknown): void {
+  const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of clients) res.write(frame);
+}
+
+setInterval(() => {
+  for (const res of clients) res.write(": ping\n\n");
+}, 25_000).unref();
+
+function upsert(entry: FeedEntry): void {
+  if (!feed.includes(entry)) {
+    feed.unshift(entry);
+    if (feed.length > MAX_FEED) feed.length = MAX_FEED;
+  }
+  publish("entry", entry);
+}
+
+// ───────────────────────────── views ─────────────────────────────
+
+function policyView() {
+  const s = gateway.policy.status(SUPPORTED_CHAINS);
+  return {
+    frozen: s.frozen,
+    frozenReason: s.frozenReason ?? null,
+    strictMode: s.strictMode,
+    chains: Object.fromEntries(
+      Object.entries(s.chains).map(([k, v]) => [
+        k,
+        {
+          maxPerTx: formatEther(v.maxPerTxWei),
+          dailyCap: formatEther(v.dailyCapWei),
+          spent: formatEther(v.spentWei),
+          remaining: formatEther(v.remainingWei),
+        },
+      ]),
+    ),
+  };
+}
+
+function stateView() {
+  return {
+    network: env.NEAR_NETWORK_ID,
+    mpcContract: env.MPC_CONTRACT_ID,
+    nearAccount,
+    agent: {
+      path: AGENT_PATH,
+      address: agentKey.ethereumAddress,
+      publicKey: agentKey.nearPublicKey,
+      compressedPublicKey: agentKey.compressedPublicKey,
+    },
+    treasury: { path: TREASURY_PATH, address: treasury },
+    chains: SUPPORTED_CHAINS.map((k) => {
+      const c = getChainConfig(k, env);
+      return { key: c.key, name: c.name, chainId: c.chainId.toString(), currency: c.currency, explorerUrl: c.explorerUrl };
+    }),
+    policy: policyView(),
+  };
+}
+
+async function balancesView() {
+  const evm = await Promise.all(
+    SUPPORTED_CHAINS.map(async (k) => {
+      try {
+        const wei = (await gateway.executor(k)?.getBalance(agentKey.ethereumAddress)) ?? 0n;
+        return [k, { ok: true, eth: formatEther(wei) }] as const;
+      } catch (err) {
+        return [k, { ok: false, error: err instanceof Error ? err.message : String(err) }] as const;
+      }
+    }),
+  );
+  let near: { ok: boolean; near?: string; error?: string };
+  try {
+    const acct = await nearProvider.viewAccount({ accountId: nearAccount });
+    near = { ok: true, near: (Number(BigInt(acct.amount) / 10n ** 18n) / 1e6).toFixed(4) };
+  } catch (err) {
+    near = { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  return { address: agentKey.ethereumAddress, chains: Object.fromEntries(evm), near, at: Date.now() };
+}
+
+// ───────────────────────────── intents ─────────────────────────────
+
+function startIntent(body: Record<string, unknown>): FeedEntry {
+  const entry: FeedEntry = {
+    id: randomUUID(),
+    source: "dashboard",
+    createdAt: Date.now(),
+    chain: String(body.chain ?? ""),
+    to: String(body.to ?? ""),
+    amount: String(body.amount ?? ""),
+    reason: String(body.reason ?? ""),
+    status: "running",
+    stages: [],
+  };
+  upsert(entry);
+
+  void (async () => {
+    const result: IntentResult = await gateway.execute(body, {
+      onStage: (s) => {
+        entry.stages.push({ stage: s.stage, at: Date.now() });
+        if (s.stage === "policy_passed") entry.from = s.from;
+        if (s.stage === "nonce_acquired") entry.nonce = s.nonce;
+        if (s.stage === "mpc_signed") entry.nearTxHash = s.nearTxHash;
+        if (s.stage === "broadcast") {
+          entry.txHash = s.txHash;
+          entry.explorerUrl = s.explorerUrl;
+          entry.status = "broadcast";
+        }
+        upsert(entry);
+      },
+    });
+
+    entry.executionTimeMs = result.executionTimeMs;
+    if (!result.success) {
+      entry.status = result.rejectedBeforeSigning ? "blocked" : "failed";
+      entry.code = result.code;
+      entry.error = result.error;
+      entry.rejectedBeforeSigning = result.rejectedBeforeSigning;
+      upsert(entry);
+      publish("policy", policyView());
+      return;
+    }
+    publish("policy", policyView());
+
+    const executor = gateway.executor(result.chain);
+    try {
+      const conf = await executor?.waitForConfirmation?.(result.txHash);
+      if (conf) {
+        entry.blockNumber = conf.blockNumber;
+        entry.status = conf.status === "success" ? "confirmed" : "failed";
+        if (conf.status === "reverted") entry.error = "Transaction reverted on-chain";
+        entry.stages.push({ stage: "confirmed", at: Date.now() });
+      }
+    } catch (err) {
+      entry.error = `Broadcast OK, confirmation not observed yet: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    upsert(entry);
+  })().catch((err: unknown) => {
+    entry.status = "failed";
+    entry.error = err instanceof Error ? err.message : String(err);
+    upsert(entry);
+  });
+
+  return entry;
+}
+
+// ───────────────────────────── http plumbing ─────────────────────────────
+
+function json(res: ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+  res.end(JSON.stringify(body));
+}
+
+function isLocalOrigin(req: IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  if (!origin) return true; // same-origin fetches from some browsers / curl
+  try {
+    const host = new URL(origin).hostname;
+    return host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+  } catch {
+    return false;
+  }
+}
+
+async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+  let size = 0;
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > MAX_BODY) throw new HttpError(413, "Request body too large");
+    chunks.push(chunk as Buffer);
+  }
+  try {
+    const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
+    return parsed as Record<string, unknown>;
+  } catch {
+    throw new HttpError(400, "Body must be a JSON object");
+  }
+}
+
+class HttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
+const MIME: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".ico": "image/x-icon",
+  ".json": "application/json",
+};
+
+function serveStatic(pathname: string, res: ServerResponse): boolean {
+  if (!existsSync(DASHBOARD_DIST)) return false;
+  const rel = normalize(decodeURIComponent(pathname)).replace(/^([/\\])+/, "");
+  let file = join(DASHBOARD_DIST, rel);
+  if (!file.startsWith(DASHBOARD_DIST)) return false; // path traversal
+  if (!existsSync(file) || statSync(file).isDirectory()) file = join(DASHBOARD_DIST, "index.html"); // SPA fallback
+  res.writeHead(200, { "content-type": MIME[extname(file)] ?? "application/octet-stream" });
+  res.end(readFileSync(file));
+  return true;
+}
+
+const server = createServer((req, res) => {
+  void (async () => {
+    const url = new URL(req.url ?? "/", `http://${HOST}`);
+    const route = `${req.method} ${url.pathname}`;
+    try {
+      if (req.method === "POST" && !isLocalOrigin(req)) throw new HttpError(403, "Cross-origin requests are not allowed");
+
+      switch (route) {
+        case "GET /api/state":
+          return json(res, 200, stateView());
+        case "GET /api/balances":
+          return json(res, 200, await balancesView());
+        case "GET /api/feed":
+          return json(res, 200, feed);
+        case "GET /api/events": {
+          res.writeHead(200, {
+            "content-type": "text/event-stream",
+            "cache-control": "no-cache, no-transform",
+            connection: "keep-alive",
+          });
+          res.write(`event: hello\ndata: ${JSON.stringify({ policy: policyView() })}\n\n`);
+          clients.add(res);
+          req.on("close", () => clients.delete(res));
+          return;
+        }
+        case "POST /api/intents": {
+          const body = await readJson(req);
+          const entry = startIntent(body);
+          return json(res, 202, { id: entry.id });
+        }
+        case "POST /api/policy/freeze": {
+          const body = await readJson(req);
+          if (typeof body.frozen !== "boolean") throw new HttpError(400, "'frozen' must be a boolean");
+          if (body.frozen) gateway.policy.freeze(typeof body.reason === "string" ? body.reason.slice(0, 200) : "dashboard kill switch");
+          else gateway.policy.unfreeze();
+          const p = policyView();
+          publish("policy", p);
+          return json(res, 200, p);
+        }
+        default:
+          if (url.pathname.startsWith("/api/")) throw new HttpError(404, "Not found");
+          if (req.method === "GET" && serveStatic(url.pathname, res)) return;
+          throw new HttpError(404, existsSync(DASHBOARD_DIST) ? "Not found" : "Dashboard not built: run `npm run dashboard`");
+      }
+    } catch (err) {
+      const status = err instanceof HttpError ? err.status : 500;
+      if (!res.headersSent) json(res, status, { error: err instanceof Error ? err.message : String(err) });
+      else res.end();
+    }
+  })();
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`GhostSign API on http://${HOST}:${PORT}`);
+  console.log(`  agent ${agentKey.ethereumAddress} (${nearAccount} / ${AGENT_PATH})`);
+  console.log(`  MPC   ${env.MPC_CONTRACT_ID} on NEAR ${env.NEAR_NETWORK_ID}`);
+  if (existsSync(DASHBOARD_DIST)) console.log(`  serving dashboard from ${DASHBOARD_DIST}`);
+});
+
+export type { FeedEntry };

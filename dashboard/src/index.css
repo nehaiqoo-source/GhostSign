@@ -1,0 +1,29 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+html,
+body {
+  background: #09090b;
+  color: #e4e4e7;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Subtle grid backdrop */
+body {
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgb(16 185 129 / 0.08), transparent 70%),
+    linear-gradient(rgb(255 255 255 / 0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(255 255 255 / 0.02) 1px, transparent 1px);
+  background-size: 100% 100%, 32px 32px, 32px 32px;
+  background-attachment: fixed;
+}
+
+@keyframes pulse-ring {
+  0% { box-shadow: 0 0 0 0 rgb(52 211 153 / 0.5); }
+  100% { box-shadow: 0 0 0 8px rgb(52 211 153 / 0); }
+}
+.pulse-ring { animation: pulse-ring 1.4s ease-out infinite; }

@@ -377,3 +377,35 @@ describe("EvmExecutor (multi-chain)", () => {
     await assert.rejects(ex.send("ethereum-1", { to: DEST, value: 1n }), (e: unknown) => e instanceof GhostSignError && e.code === ErrorCode.CHAIN_MISMATCH);
   });
 });
+
+describe("progress stages", () => {
+  it("gateway + executor emit stages in pipeline order", async () => {
+    const mpc = fakeMpc(0xabcdefn);
+    const chain = fakeChain(84532n, parseEther("1"));
+    const ex = new EvmExecutor({
+      chain: getChainConfig("base-sepolia", env),
+      signer: mpc.signerFor("ghostsign-agent.testnet"),
+      rootPublicKey: mpc.rootNear,
+      nonceManager: new NonceManager(),
+      provider: chain.provider,
+    });
+    const g = new IntentGateway({ policy: policy(), executors: { "base-sepolia": ex } });
+    const stages: string[] = [];
+    const r = await g.execute(
+      { chain: "base-sepolia", to: DEST, amount: "0.001", reason: "stage test" },
+      { onStage: (s) => stages.push(s.stage) },
+    );
+    assert.equal(r.success, true);
+    assert.deepEqual(stages, ["validated", "policy_passed", "nonce_acquired", "mpc_signing", "mpc_signed", "broadcast"]);
+  });
+
+  it("a blocked intent never reaches nonce or MPC stages", async () => {
+    const g = new IntentGateway({ policy: policy(), executors: { "base-sepolia": fakeExecutor("base-sepolia") } });
+    const stages: string[] = [];
+    await g.execute(
+      { chain: "base-sepolia", to: DEST, amount: "1", reason: "over cap" },
+      { onStage: (s) => stages.push(s.stage) },
+    );
+    assert.deepEqual(stages, ["validated"]);
+  });
+});
