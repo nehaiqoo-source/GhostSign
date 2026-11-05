@@ -9,7 +9,8 @@ Built at **NEAR HACKATHON** · Tracks: **AI Security & Defense** · **Agent Econ
 | | |
 |---|---|
 | 🎬 **Demo video** | [Watch on X](https://x.com/anki_anc/status/2118342923180007918) |
-| 🌐 **Live dashboard** | [ghostsign-production.up.railway.app](https://ghostsign-production.up.railway.app) (anyone can view; executing intents and the kill switch need the judge access code: DM [@anki_anc](https://x.com/anki_anc) on X) |
+| 🌐 **Live dashboard** | [ghostsign-production.up.railway.app](https://ghostsign-production.up.railway.app) (open it, click any preset, enter the code below and hit **Execute**) |
+| 🔑 **Judge access code** | `ghost-S0eLIAz2Lse-` (testnet only: transfers can only go to the agent's own treasury, capped at 0.001 ETH per tx and 0.01 ETH per day per chain, rate-limited) |
 | 🔗 **On-chain proofs** | [Transactions signed by NEAR MPC on Ethereum Sepolia and Base Sepolia](#-verified-on-chain-proofs) |
 
 ---
