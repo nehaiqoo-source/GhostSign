@@ -4,7 +4,13 @@
 
 > An AI agent controls wallets on Ethereum, Base, and any other EVM chain **without a single private key existing anywhere**. Every transaction is signed by the NEAR MPC network, under policy guardrails the agent cannot bypass.
 
-**NEAR Global Hackathon** · Tracks: **AI Agent Economy** · **Chain Abstraction**
+Built at **NEAR HACKATHON** · Tracks: **AI Security & Defense** · **Agent Economy**
+
+| | |
+|---|---|
+| 🎬 **Demo video** | [Watch on X](https://x.com/anki_anc/status/2118342923180007918) |
+| 🌐 **Live dashboard** | [ghostsign-production.up.railway.app](https://ghostsign-production.up.railway.app) (anyone can view; executing intents and the kill switch need the judge access code: DM [@anki_anc](https://x.com/anki_anc) on X) |
+| 🔗 **On-chain proofs** | [Transactions signed by NEAR MPC on Ethereum Sepolia and Base Sepolia](#-verified-on-chain-proofs) |
 
 ---
 
