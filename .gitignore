@@ -1,0 +1,31 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+dashboard/dist/
+.next/
+out/
+*.tsbuildinfo
+
+# secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.keystore
+id_*
+keys/
+secrets/
+credentials*.json
+**/near-credentials/
+
+# logs & OS
+*.log
+npm-debug.log*
+.DS_Store
+
+# local tooling
+.claude/settings.local.json
