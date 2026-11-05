@@ -18,6 +18,8 @@ export interface PolicyView {
 }
 
 export interface StateView {
+  mode: "local" | "public";
+  accessRequired: boolean;
   network: string;
   mpcContract: string;
   nearAccount: string;
@@ -74,15 +76,49 @@ export interface IntentInput {
   reason: string;
 }
 
+const ACCESS_KEY = "ghostsign.access";
+let accessCode: string | null = (() => {
+  try {
+    return sessionStorage.getItem(ACCESS_KEY);
+  } catch {
+    return null;
+  }
+})();
+
+export function getAccessCode(): string | null {
+  return accessCode;
+}
+
+export function setAccessCode(code: string | null): void {
+  accessCode = code;
+  try {
+    if (code) sessionStorage.setItem(ACCESS_KEY, code);
+    else sessionStorage.removeItem(ACCESS_KEY);
+  } catch {
+    // storage unavailable (private mode): keep it in memory only
+  }
+}
+
+export class ApiError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
-    headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
+    headers: {
+      "content-type": "application/json",
+      ...(accessCode ? { "x-ghostsign-access": accessCode } : {}),
+      ...(init?.headers ?? {}),
+    },
   });
   const body: unknown = await res.json().catch(() => ({}));
   if (!res.ok) {
     const msg = (body as { error?: string }).error ?? `${res.status} ${res.statusText}`;
-    throw new Error(msg);
+    if (res.status === 401) setAccessCode(null);
+    throw new ApiError(res.status, msg);
   }
   return body as T;
 }
@@ -93,6 +129,8 @@ export const api = {
   feed: () => request<FeedEntry[]>("/api/feed"),
   submitIntent: (intent: IntentInput) =>
     request<{ id: string }>("/api/intents", { method: "POST", body: JSON.stringify(intent) }),
+  checkAccess: (code: string) =>
+    request<{ ok: true }>("/api/auth/check", { method: "POST", body: JSON.stringify({ code }) }),
   setFrozen: (frozen: boolean) =>
     request<PolicyView>("/api/policy/freeze", { method: "POST", body: JSON.stringify({ frozen }) }),
 };

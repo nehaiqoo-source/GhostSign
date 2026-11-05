@@ -1,8 +1,15 @@
 /**
- * GhostSign local API for the dashboard.
+ * GhostSign API + dashboard server.
  *
- * Binds to 127.0.0.1 only: this process holds the NEAR key that authorises MPC signatures, so it
- * must never be exposed to a network. Mutating requests from a non-local browser Origin are refused.
+ * LOCAL mode (default): binds 127.0.0.1, no access code.
+ * PUBLIC mode (HOST is not loopback, e.g. on Railway, or GHOSTSIGN_PUBLIC_MODE=true): this process holds the NEAR key that
+ * authorises MPC signatures, so it fails closed:
+ *   - refuses to start without GHOSTSIGN_ACCESS_CODE (≥ 8 chars); every POST needs it
+ *   - forces strict allowlist mode; default allowlist = the agent's own treasury address
+ *   - caps clamped to a public ceiling (default 0.001 ETH/tx, 0.01 ETH/24h; GHOSTSIGN_PUBLIC_* to change)
+ *   - per-IP and global rate limits; same-origin only for browser POSTs
+ *
+ *   GET  /api/health           liveness
  *
  *   GET  /api/state            agent identity, chains, policy
  *   GET  /api/balances         live balances (EVM chains + NEAR)
@@ -18,27 +25,60 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { formatEther } from "ethers";
+import { formatEther, parseEther } from "ethers";
 import { JsonRpcProvider as NearRpcProvider } from "near-api-js";
 import { IntentGateway, type IntentResult, type IntentStage } from "../agent/intentGateway.js";
 import { SUPPORTED_CHAINS, getChainConfig, txExplorerUrl } from "../chains/config.js";
 import { loadEnv, requireEnv } from "../config/env.js";
 import { deriveChildPublicKey } from "../crypto/kdf.js";
+import { PolicyEngine } from "../policy/guard.js";
 import { PROOF_AGENT_ACCOUNT, PROVEN_TXS } from "./history.js";
+import { ACCESS_HEADER, RateLimiter, checkAccessCode, clientIp, isAllowedOrigin } from "./security.js";
 
-const env = loadEnv();
-const PORT = Number(process.env.GHOSTSIGN_API_PORT ?? 8787);
-const HOST = "127.0.0.1";
+const baseEnv = loadEnv();
+const PORT = Number(process.env.PORT ?? process.env.GHOSTSIGN_API_PORT ?? 8787);
+const HOST = process.env.HOST ?? (process.env.RAILWAY_ENVIRONMENT ? "0.0.0.0" : "127.0.0.1");
+const PUBLIC = /^(1|true|yes)$/i.test(process.env.GHOSTSIGN_PUBLIC_MODE ?? "") || !["127.0.0.1", "localhost", "::1"].includes(HOST);
+const ACCESS_CODE = process.env.GHOSTSIGN_ACCESS_CODE?.trim() || undefined;
 const AGENT_PATH = "ethereum-1";
 const TREASURY_PATH = "ethereum-2";
 const MAX_BODY = 16 * 1024;
 const MAX_FEED = 200;
 const DASHBOARD_DIST = resolve(fileURLToPath(new URL("../../dashboard/dist", import.meta.url)));
 
-const nearAccount = requireEnv(env, "NEAR_ACCOUNT_ID");
-const gateway = IntentGateway.fromEnv({ env });
-const agentKey = deriveChildPublicKey(env.MPC_ROOT_PUBLIC_KEY, nearAccount, AGENT_PATH);
-const treasury = deriveChildPublicKey(env.MPC_ROOT_PUBLIC_KEY, nearAccount, TREASURY_PATH).ethereumAddress;
+const nearAccount = requireEnv(baseEnv, "NEAR_ACCOUNT_ID");
+const agentKey = deriveChildPublicKey(baseEnv.MPC_ROOT_PUBLIC_KEY, nearAccount, AGENT_PATH);
+const treasury = deriveChildPublicKey(baseEnv.MPC_ROOT_PUBLIC_KEY, nearAccount, TREASURY_PATH).ethereumAddress;
+
+function minEth(a: string, b: string): string {
+  return parseEther(a) <= parseEther(b) ? a : b;
+}
+
+if (PUBLIC && (!ACCESS_CODE || ACCESS_CODE.length < 8)) {
+  console.error("Refusing to start in public mode: set GHOSTSIGN_ACCESS_CODE (at least 8 characters).");
+  process.exit(1);
+}
+
+/** Public mode hardens the policy regardless of what the env says. */
+const env = PUBLIC
+  ? {
+      ...baseEnv,
+      POLICY_STRICT_MODE: true,
+      POLICY_ALLOWLIST: baseEnv.POLICY_ALLOWLIST?.length ? baseEnv.POLICY_ALLOWLIST : [treasury.toLowerCase()],
+      // Caps can only be lowered in public mode, never raised above the public ceiling.
+      POLICY_MAX_PER_TX_ETH: minEth(baseEnv.POLICY_MAX_PER_TX_ETH, process.env.GHOSTSIGN_PUBLIC_MAX_PER_TX_ETH ?? "0.001"),
+      POLICY_DAILY_CAP_ETH: minEth(baseEnv.POLICY_DAILY_CAP_ETH, process.env.GHOSTSIGN_PUBLIC_DAILY_CAP_ETH ?? "0.01"),
+    }
+  : baseEnv;
+
+const gateway = IntentGateway.fromEnv({ env, policy: PolicyEngine.fromEnv(env) });
+
+const limits = {
+  intentsPerIp: new RateLimiter(PUBLIC ? 5 : 1000, 10 * 60_000),
+  intentsGlobal: new RateLimiter(PUBLIC ? 40 : 100_000, 60 * 60_000),
+  freezePerIp: new RateLimiter(PUBLIC ? 20 : 1000, 10 * 60_000),
+  authPerIp: new RateLimiter(PUBLIC ? 10 : 1000, 10 * 60_000),
+};
 const nearProvider = new NearRpcProvider({ url: env.NEAR_NODE_URL });
 
 // ───────────────────────────── audit feed ─────────────────────────────
@@ -139,6 +179,8 @@ function policyView() {
 
 function stateView() {
   return {
+    mode: PUBLIC ? "public" : "local",
+    accessRequired: !!ACCESS_CODE,
     network: env.NEAR_NETWORK_ID,
     mpcContract: env.MPC_CONTRACT_ID,
     nearAccount,
@@ -251,17 +293,6 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
-function isLocalOrigin(req: IncomingMessage): boolean {
-  const origin = req.headers.origin;
-  if (!origin) return true; // same-origin fetches from some browsers / curl
-  try {
-    const host = new URL(origin).hostname;
-    return host === "localhost" || host === "127.0.0.1" || host === "[::1]";
-  } catch {
-    return false;
-  }
-}
-
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   let size = 0;
   const chunks: Buffer[] = [];
@@ -308,12 +339,32 @@ function serveStatic(pathname: string, res: ServerResponse): boolean {
 
 const server = createServer((req, res) => {
   void (async () => {
-    const url = new URL(req.url ?? "/", `http://${HOST}`);
-    const route = `${req.method} ${url.pathname}`;
+    const ip = clientIp(req, PUBLIC);
+    const limit = (rl: RateLimiter, key: string) => {
+      const wait = rl.take(key);
+      if (wait > 0) throw new HttpError(429, `Rate limit reached, try again in ${wait}s`);
+    };
     try {
-      if (req.method === "POST" && !isLocalOrigin(req)) throw new HttpError(403, "Cross-origin requests are not allowed");
+      // Fixed base: HOST may be an IPv6 literal ("::"), which is not a valid URL host.
+      const url = new URL(req.url ?? "/", "http://localhost");
+      const route = `${req.method} ${url.pathname}`;
+      if (req.method === "POST") {
+        if (!isAllowedOrigin(req)) throw new HttpError(403, "Cross-origin requests are not allowed");
+        if (route !== "POST /api/auth/check" && !checkAccessCode(req.headers[ACCESS_HEADER], ACCESS_CODE)) {
+          limit(limits.authPerIp, ip);
+          throw new HttpError(401, "Access code required");
+        }
+      }
 
       switch (route) {
+        case "GET /api/health":
+          return json(res, 200, { ok: true });
+        case "POST /api/auth/check": {
+          limit(limits.authPerIp, ip);
+          const body = await readJson(req);
+          if (!checkAccessCode(body.code, ACCESS_CODE)) throw new HttpError(401, "Wrong access code");
+          return json(res, 200, { ok: true });
+        }
         case "GET /api/state":
           return json(res, 200, stateView());
         case "GET /api/balances":
@@ -332,11 +383,14 @@ const server = createServer((req, res) => {
           return;
         }
         case "POST /api/intents": {
+          limit(limits.intentsPerIp, ip);
+          limit(limits.intentsGlobal, "global");
           const body = await readJson(req);
           const entry = startIntent(body);
           return json(res, 202, { id: entry.id });
         }
         case "POST /api/policy/freeze": {
+          limit(limits.freezePerIp, ip);
           const body = await readJson(req);
           if (typeof body.frozen !== "boolean") throw new HttpError(400, "'frozen' must be a boolean");
           if (body.frozen) gateway.policy.freeze(typeof body.reason === "string" ? body.reason.slice(0, 200) : "dashboard kill switch");
@@ -355,11 +409,18 @@ const server = createServer((req, res) => {
       if (!res.headersSent) json(res, status, { error: err instanceof Error ? err.message : String(err) });
       else res.end();
     }
-  })();
+  })().catch((err: unknown) => {
+    // Last resort: never let one request take the process down.
+    console.error("request handler failed:", err);
+    if (!res.headersSent) res.writeHead(500).end();
+    else res.end();
+  });
 });
 
+process.on("unhandledRejection", (err) => console.error("unhandled rejection:", err));
+
 server.listen(PORT, HOST, () => {
-  console.log(`GhostSign API on http://${HOST}:${PORT}`);
+  console.log(`GhostSign API on http://${HOST}:${PORT} (${PUBLIC ? "PUBLIC mode: access code + strict allowlist" : "local mode"})`);
   console.log(`  agent ${agentKey.ethereumAddress} (${nearAccount} / ${AGENT_PATH})`);
   console.log(`  MPC   ${env.MPC_CONTRACT_ID} on NEAR ${env.NEAR_NETWORK_ID}`);
   if (existsSync(DASHBOARD_DIST)) console.log(`  serving dashboard from ${DASHBOARD_DIST}`);

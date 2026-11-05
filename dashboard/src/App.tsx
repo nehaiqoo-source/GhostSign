@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  ApiError,
   api,
+  getAccessCode,
   nearTxUrl,
+  setAccessCode,
   short,
   useEventStream,
   type BalancesView,
@@ -23,6 +26,7 @@ export function App() {
   const [balances, setBalances] = useState<BalancesView | null>(null);
   const [feed, setFeed] = useState<FeedEntry[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [unlocked, setUnlocked] = useState(() => !!getAccessCode());
 
   const refreshBalances = useCallback(() => {
     api.balances().then(setBalances).catch(() => undefined);
@@ -92,10 +96,17 @@ export function App() {
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         <div className="flex flex-col gap-6">
           <IdentityCard state={state} balances={balances} onRefresh={refreshBalances} />
-          <PolicyCard policy={policy} onPolicy={setPolicy} />
+          <PolicyCard policy={policy} onPolicy={setPolicy} locked={state.accessRequired && !unlocked} onLocked={() => setUnlocked(false)} />
         </div>
         <div className="flex flex-col gap-6 lg:col-span-2">
-          <IntentPanel state={state} policy={policy} feed={feed} />
+          <IntentPanel
+            state={state}
+            policy={policy}
+            feed={feed}
+            locked={state.accessRequired && !unlocked}
+            onUnlocked={() => setUnlocked(true)}
+            onLocked={() => setUnlocked(false)}
+          />
           <FeedCard feed={feed} network={state.network} />
         </div>
       </div>
@@ -131,6 +142,7 @@ function Header({ state, conn }: { state: StateView; conn: "connecting" | "live"
         <Badge tone="emerald" dot>
           NEAR {state.network === "testnet" ? "Testnet" : state.network}
         </Badge>
+        {state.mode === "public" && <Badge tone="amber">Public demo · guarded</Badge>}
         <Badge tone="zinc">
           MPC <span className="font-mono">{state.mpcContract}</span>
         </Badge>
@@ -209,7 +221,17 @@ function IdentityCard({ state, balances, onRefresh }: { state: StateView; balanc
 
 // ───────────────────────────── policy ─────────────────────────────
 
-function PolicyCard({ policy, onPolicy }: { policy: PolicyView; onPolicy: (p: PolicyView) => void }) {
+function PolicyCard({
+  policy,
+  onPolicy,
+  locked,
+  onLocked,
+}: {
+  policy: PolicyView;
+  onPolicy: (p: PolicyView) => void;
+  locked: boolean;
+  onLocked: () => void;
+}) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -219,6 +241,7 @@ function PolicyCard({ policy, onPolicy }: { policy: PolicyView; onPolicy: (p: Po
     try {
       onPolicy(await api.setFrozen(!policy.frozen));
     } catch (e) {
+      if (e instanceof ApiError && e.status === 401) onLocked();
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
@@ -263,17 +286,21 @@ function PolicyCard({ policy, onPolicy }: { policy: PolicyView; onPolicy: (p: Po
           type="button"
           role="switch"
           aria-checked={policy.frozen}
-          disabled={busy}
+          disabled={busy || locked}
+          title={locked ? "Enter the judge access code to use the kill switch" : undefined}
           onClick={() => void toggle()}
           className={`flex w-full items-center justify-between gap-3 rounded-xl border px-4 py-3.5 text-left transition ${
             policy.frozen
               ? "border-red-500/60 bg-red-600/20 shadow-[0_0_30px_-8px_rgb(239_68_68/0.6)]"
               : "border-red-500/30 bg-red-500/5 hover:border-red-500/60 hover:bg-red-500/10"
-          }`}
+          } disabled:cursor-not-allowed disabled:opacity-60`}
         >
           <div>
             <div className="text-sm font-semibold text-red-200">Emergency Freeze / Kill Switch</div>
-            <div className="text-xs text-red-300/70">{policy.frozen ? "Engaged: all signing halted" : "Disengaged: agent may sign"}</div>
+            <div className="text-xs text-red-300/70">
+              {policy.frozen ? "Engaged: all signing halted" : "Disengaged: agent may sign"}
+              {locked && " · access code required"}
+            </div>
           </div>
           <span className={`relative inline-flex h-7 w-12 shrink-0 items-center rounded-full transition ${policy.frozen ? "bg-red-500" : "bg-zinc-700"}`}>
             <span className={`inline-block size-5 rounded-full bg-white shadow transition ${policy.frozen ? "translate-x-6" : "translate-x-1"}`} />
@@ -289,7 +316,21 @@ function PolicyCard({ policy, onPolicy }: { policy: PolicyView; onPolicy: (p: Po
 
 type Mode = "single" | "burst";
 
-function IntentPanel({ state, policy, feed }: { state: StateView; policy: PolicyView; feed: FeedEntry[] }) {
+function IntentPanel({
+  state,
+  policy,
+  feed,
+  locked,
+  onUnlocked,
+  onLocked,
+}: {
+  state: StateView;
+  policy: PolicyView;
+  feed: FeedEntry[];
+  locked: boolean;
+  onUnlocked: () => void;
+  onLocked: () => void;
+}) {
   const [chain, setChain] = useState<ChainKey>("ethereum-sepolia");
   const [mode, setMode] = useState<Mode>("single");
   const [to, setTo] = useState(state.treasury.address);
@@ -361,6 +402,7 @@ function IntentPanel({ state, policy, feed }: { state: StateView; policy: Policy
       const ids = await Promise.all(chains.map((c) => api.submitIntent({ chain: c, to, amount, reason } satisfies IntentInput)));
       setActiveIds(ids.map((r) => r.id));
     } catch (e) {
+      if (e instanceof ApiError && e.status === 401) onLocked();
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
       setSubmitting(false);
@@ -372,6 +414,7 @@ function IntentPanel({ state, policy, feed }: { state: StateView; policy: Policy
 
   return (
     <Card title="Intent Executor" icon={Icon.bolt} right={<span className="text-xs text-zinc-500">signs via NEAR MPC</span>}>
+      {locked && <AccessGate onUnlocked={onUnlocked} />}
       <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
         {presets.map((p) => (
           <button
@@ -462,9 +505,10 @@ function IntentPanel({ state, policy, feed }: { state: StateView; policy: Policy
       <div className="mt-5 flex flex-wrap items-center gap-3">
         <button
           type="button"
-          disabled={submitting}
+          disabled={submitting || locked}
+          title={locked ? "Enter the judge access code first" : undefined}
           onClick={() => void submit()}
-          className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-5 py-2.5 text-sm font-semibold text-zinc-950 shadow-[0_0_24px_-6px_rgb(16_185_129/0.7)] transition hover:bg-emerald-400 disabled:opacity-60"
+          className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-5 py-2.5 text-sm font-semibold text-zinc-950 shadow-[0_0_24px_-6px_rgb(16_185_129/0.7)] transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
         >
           {submitting ? <Spinner /> : Icon.bolt}
           Execute Intent via NEAR MPC{mode === "burst" ? " ×2" : ""}
@@ -481,6 +525,62 @@ function IntentPanel({ state, policy, feed }: { state: StateView; policy: Policy
         </div>
       )}
     </Card>
+  );
+}
+
+function AccessGate({ onUnlocked }: { onUnlocked: () => void }) {
+  const [code, setCode] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const unlock = async () => {
+    if (!code.trim()) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await api.checkAccess(code.trim());
+      setAccessCode(code.trim());
+      onUnlocked();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        void unlock();
+      }}
+      className="mb-5 flex flex-col gap-3 rounded-xl border border-amber-500/30 bg-amber-500/5 p-4 sm:flex-row sm:items-center"
+    >
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium text-amber-200">Judge access</div>
+        <div className="text-xs text-zinc-400">
+          Viewing is open. Enter the access code to execute live intents (real testnet transactions via NEAR MPC).
+        </div>
+      </div>
+      <div className="flex gap-2">
+        <input
+          type="password"
+          value={code}
+          onChange={(e) => setCode(e.target.value)}
+          placeholder="Access code"
+          autoComplete="off"
+          className="w-40 rounded-lg border border-zinc-700 bg-zinc-950/60 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-amber-400/60"
+        />
+        <button
+          type="submit"
+          disabled={busy || !code.trim()}
+          className="rounded-lg bg-amber-400 px-4 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-amber-300 disabled:opacity-50"
+        >
+          {busy ? <Spinner /> : "Unlock"}
+        </button>
+      </div>
+      {err && <div className="text-xs text-red-300 sm:basis-full">{err}</div>}
+    </form>
   );
 }
 

@@ -142,11 +142,38 @@ Other entry points:
 | Command | What it does |
 |---|---|
 | `npm run dashboard` | Production build of the UI, served by the API at http://127.0.0.1:8787 |
+| `npm run build:all && npm start` | Exactly what Railway runs (compiled server + built UI) |
 | `npm run demo -- --dry` | Policy-violation demo only (spends nothing) |
 | `npm run demo` | Live: one intent on Ethereum Sepolia, one on Base Sepolia, then 3 blocked intents |
 | `npm run demo -- --concurrent` | Also fires two intents at once to show the nonce queue |
 | `npx tsx scripts/smoke-sign.ts` | One real MPC signature over a Sepolia tx, verified but not broadcast |
 | `npm run typecheck` | Strict type check of `src/`, `scripts/` and `test/` |
+
+### Deploy on Railway (hosted judge demo)
+
+One service serves both the API and the built dashboard. [`railway.json`](railway.json) holds the build, start and health-check config.
+
+1. Railway → **New Project → Deploy from GitHub repo** → select this repository.
+2. **Variables** (encrypted by Railway, never committed):
+
+   | Variable | Value |
+   |---|---|
+   | `NEAR_ACCOUNT_ID` | e.g. `your-agent.testnet` |
+   | `NEAR_PRIVATE_KEY` | `ed25519:…` |
+   | `GHOSTSIGN_ACCESS_CODE` | a long random code you share only with judges (min. 8 chars) |
+
+   Everything else has testnet defaults. Optional: `ETHEREUM_SEPOLIA_RPC`, `BASE_SEPOLIA_RPC`, `POLICY_*`.
+3. **Settings → Networking → Generate Domain.** Open it: viewing is public, and executing or using the kill switch needs the access code.
+
+On Railway the server runs in **public mode** and fails closed:
+
+- It refuses to start without `GHOSTSIGN_ACCESS_CODE`, and every POST needs the code.
+- It forces a strict allowlist: by default only the agent's own `ethereum-2` treasury can receive funds, so value never leaves MPC-controlled addresses.
+- Caps are clamped to a public ceiling of 0.001 ETH per tx and 0.01 ETH per 24h (`GHOSTSIGN_PUBLIC_MAX_PER_TX_ETH` / `GHOSTSIGN_PUBLIC_DAILY_CAP_ETH`). `POLICY_*` can lower them, never raise them.
+- Rate limits: 5 intents per IP per 10 minutes, 40 per hour in total, and brute-force protection on the access code.
+- Browser POSTs are accepted from the same origin only.
+
+Keep **1 replica**: the nonce queue and spend ledger are in-memory. Fund the agent address on Sepolia and Base Sepolia and keep a few NEAR on the account. Use a dedicated testnet account for the hosted demo, never one that holds real value.
 
 ### Using GhostSign from an agent
 
@@ -185,7 +212,7 @@ else console.log(result.code, result.rejectedBeforeSigning); // e.g. SPEND_CAP_E
 
 GhostSign is the missing **financial safety layer** that lets agents hold and move value on their own:
 
-- **No key to steal.** A fully compromised agent process holds nothing that signs on a foreign chain. The only credential is a NEAR key, which can be a function-call key scoped to `sign` and revoked instantly on-chain.
+- **No key to steal.** A fully compromised agent process holds nothing that signs on a foreign chain. The only credential is one NEAR account key, which can be rotated or deleted on-chain in one transaction, instantly cutting off signing on every chain at once.
 - **Guardrails the agent cannot talk its way past.** Caps, destination rules, and the kill switch run in deterministic code **before** the MPC call, so a hallucinated amount or a prompt-injected address fails closed at zero cost.
 - **Agent-native interface.** Intents are structured, carry a mandatory `reason` for the audit trail, and return typed, machine-readable outcomes (`rejectedBeforeSigning` tells the agent whether anything was spent). The schema exports as JSON Schema for direct LLM tool calling.
 - **Safe under real agent behaviour.** Concurrent and retried intents are serialised and kept gap-free by the nonce queue. Atomic spend reservations stop parallel intents from jointly overspending.
@@ -199,11 +226,12 @@ GhostSign is the missing **financial safety layer** that lets agents hold and mo
 
 ## Security notes and limitations
 
-- **The dashboard API binds to `127.0.0.1` only** and refuses cross-origin POSTs. It controls a funded signer and has no authentication, so never expose it to a network.
+- **Locally, the API binds to `127.0.0.1`** with no access code. Hosted, it switches to public mode (see [Deploy on Railway](#deploy-on-railway-hosted-judge-demo)): access code, forced strict allowlist, small caps and rate limits.
+- **A scoped NEAR key is not possible for this flow.** NEAR function-call access keys cannot attach a deposit, and MPC `sign` requires one, so the hosted server needs a full-access key. Use a dedicated testnet account.
 - **Spend ledger and nonce state are in-memory.** A restart resets the rolling 24h cap. Production use needs a persistent ledger.
 - **Caps cover transferred value.** Gas is bounded separately by the executor's worst-case balance check.
 - **`sign` uses the legacy `request.payload` arguments**, which `v1.signer-prod.testnet` accepts today. Newer contract versions add `payload_v2` / `domain_id`.
-- **The `.env` key is plaintext** in this demo setup. Use a function-call access key restricted to `sign` on the MPC contract.
+- **The `.env` key is plaintext** locally. Hosted, it lives in the platform's encrypted variables. Either way, use a dedicated testnet account.
 - Testnet only. Not audited.
 
 ## Project layout

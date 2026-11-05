@@ -46,7 +46,11 @@ const EnvSchema = z.object({
   MPC_CONTRACT_ID: nearAccountId.default("v1.signer-prod.testnet"),
   MPC_ROOT_PUBLIC_KEY: z
     .string()
-    .regex(/^secp256k1:[1-9A-HJ-NP-Za-km-z]+$/, "MPC_ROOT_PUBLIC_KEY must be 'secp256k1:<base58>'"),
+    .regex(/^secp256k1:[1-9A-HJ-NP-Za-km-z]+$/, "MPC_ROOT_PUBLIC_KEY must be 'secp256k1:<base58>'")
+    // Root key of v1.signer-prod.testnet; verify with `npm run dev -- verify`.
+    .default(
+      "secp256k1:4NfTiv3UsGahebgTaHyD9vF8KYKMBnfd6kh94mK6xv8fGBiJB8TBtFMP5WWXz6B89Ac1fbpzPwAvoyQebemHFwx3",
+    ),
   MPC_SIGN_DEPOSIT_NEAR: z
     .string()
     .regex(/^\d+(\.\d{1,24})?$/, "MPC_SIGN_DEPOSIT_NEAR must be a decimal NEAR amount")

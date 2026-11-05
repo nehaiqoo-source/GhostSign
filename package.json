@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
-    "start": "node dist/index.js",
+    "start": "node dist/server/index.js",
     "typecheck": "tsc -p tsconfig.dev.json",
     "test": "tsx --test \"test/**/*.test.ts\"",
     "demo": "tsx scripts/demo-agent.ts",
@@ -15,7 +15,9 @@
     "dashboard:build": "vite build --config dashboard/vite.config.ts",
     "dashboard:typecheck": "tsc -p dashboard/tsconfig.json",
     "dev:all": "concurrently -k -n api,ui -c green,cyan \"npm:api\" \"npm:dashboard:dev\"",
-    "dashboard": "npm run dashboard:build && npm run api"
+    "dashboard": "npm run dashboard:build && npm run api",
+    "build:all": "npm run build && npm run dashboard:build",
+    "cli": "node dist/index.js"
   },
   "author": "",
   "license": "MIT",
